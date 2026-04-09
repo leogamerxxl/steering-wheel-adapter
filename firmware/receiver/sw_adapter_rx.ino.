@@ -1,0 +1,121 @@
+/*
+ * ============================================================
+ *  STEERING WHEEL ADAPTER — RECEIVER
+ *  Board:    ESP32 WROOM-32 (at head unit, inside Logan I)
+ *  Role:     Receives button state, drives BC547 transistor
+ *            array → calibrated resistors → SW1/SW2 pins
+ *  Author:   Cosmin Leonardo Cozaciuc
+ *  Version:  1.0
+ * ============================================================
+ *
+ *  SW1/SW2 SIGNAL EXPLANATION:
+ *   Aftermarket head unit reads steering wheel commands via
+ *   two analog lines (SW1, SW2) using a resistor ladder
+ *   referenced to 12V automotive. Each button produces a
+ *   unique voltage via a different resistor to GND.
+ *
+ *   ESP32 (3.3V logic) cannot drive 12V lines directly.
+ *   Solution: BC547 NPN transistor per channel.
+ *
+ *  OUTPUT STAGE PER CHANNEL:
+ *
+ *   ESP32 GPIO ──1kΩ──► BC547 Base
+ *                        BC547 Collector ──► R_calibrated ──► SW1/SW2
+ *                        BC547 Emitter   ──► GND
+ *
+ *  RESISTOR CALIBRATION:
+ *   Measure actual voltage on SW1/SW2 per button with multimeter
+ *   (ignition ON). Then calculate:
+ *   R_cal = R_ref × V_target / (12 - V_target)
+ *   where R_ref = head unit internal pull-up (measure or check datasheet)
+ *
+ *  WIRING:
+ *   GPIO 4  → 1kΩ → BC547 → R1_cal → SW1  (Button 1: Volume +)
+ *   GPIO 5  → 1kΩ → BC547 → R2_cal → SW1  (Button 2: Volume -)
+ *   GPIO 18 → 1kΩ → BC547 → R3_cal → SW1  (Button 3: Next)
+ *   GPIO 19 → 1kΩ → BC547 → R4_cal → SW2  (Button 4: Prev)
+ *   GPIO 21 → 1kΩ → BC547 → R5_cal → SW2  (Button 5: Mute)
+ *   12V car → AMS1117-3.3V → ESP32 3.3V
+ *
+ *  SAFETY:
+ *   Watchdog timer: if no packet received in 200ms,
+ *   all outputs are released (prevents stuck buttons
+ *   if wireless link drops while driving)
+ * ============================================================
+ */
+
+#include <esp_now.h>
+#include <WiFi.h>
+
+// ── OUTPUT PINS ──────────────────────────────────────────
+// Each GPIO drives one BC547 base via 1kΩ resistor
+const int OUTPUT_PINS[] = {4, 5, 18, 19, 21};
+const int NUM_OUTPUTS   = 5;
+
+// ── WATCHDOG ─────────────────────────────────────────────
+// Release all outputs if link drops (safety — no stuck buttons)
+const unsigned long PACKET_TIMEOUT = 200; // ms
+unsigned long lastPacketTime       = 0;
+
+// ── PACKET STRUCTURE ─────────────────────────────────────
+typedef struct {
+  uint8_t buttonState;
+  uint8_t checksum;
+} ButtonPacket;
+
+// ── RECEIVE CALLBACK ─────────────────────────────────────
+void onDataReceived(const uint8_t *mac, const uint8_t *data, int len) {
+  // Validate packet size
+  if (len != sizeof(ButtonPacket)) return;
+
+  ButtonPacket *packet = (ButtonPacket *)data;
+
+  // Validate checksum — discard corrupted packets
+  if ((packet->buttonState ^ 0xAA) != packet->checksum) {
+    Serial.println("Checksum error — packet discarded");
+    return;
+  }
+
+  lastPacketTime = millis();
+
+  // Drive outputs — HIGH = transistor ON = resistor connected to SW1/SW2
+  for (int i = 0; i < NUM_OUTPUTS; i++) {
+    bool active = (packet->buttonState >> i) & 1;
+    digitalWrite(OUTPUT_PINS[i], active ? HIGH : LOW);
+  }
+}
+
+// ════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+
+  // Init ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+  esp_now_register_recv_cb(onDataReceived);
+
+  // Init output pins — all LOW (no buttons active)
+  for (int i = 0; i < NUM_OUTPUTS; i++) {
+    pinMode(OUTPUT_PINS[i], OUTPUT);
+    digitalWrite(OUTPUT_PINS[i], LOW);
+  }
+
+  lastPacketTime = millis();
+
+  Serial.println("Receiver ready");
+  Serial.print("MAC: ");
+  Serial.println(WiFi.macAddress());
+}
+
+// ════════════════════════════════════════════════════════
+void loop() {
+  // Watchdog — release all if link lost
+  if (millis() - lastPacketTime > PACKET_TIMEOUT) {
+    for (int i = 0; i < NUM_OUTPUTS; i++) {
+      digitalWrite(OUTPUT_PINS[i], LOW);
+    }
+  }
+}
